@@ -63,18 +63,25 @@ class HexiumSniperBot(commands.Cog):
     async def login_hexium(self) -> bool:
         session = await self.ensure_session()
         try:
-            h_captcha_response = await self.solve_hcaptcha()
+            # First attempt: login WITHOUT hCaptcha (it's signup-only on Hexium)
             login_data = {
                 "username": self.HEXIUM_USERNAME,
-                "password": self.HEXIUM_PASSWORD,
-                "h-captcha-response": h_captcha_response
+                "password": self.HEXIUM_PASSWORD
             }
             async with session.post(f"{HEXIUM_BASE}/login", data=login_data, allow_redirects=True) as resp:
+                print(f"[LOGIN] Status: {resp.status}, URL after redirect: {resp.url}")
+                
+                # Log first 300 chars of response for debugging
+                response_text = await resp.text()
+                print(f"[LOGIN] Response start: {response_text[:300]}")
+                
                 if resp.status == 200:
                     self.cookies = resp.cookies
                     self.logged_in = True
+                    print(f"[LOGIN] ✅ Login successful")
                     return True
                 else:
+                    print(f"[LOGIN] ❌ Login failed with status {resp.status}")
                     return False
         except Exception as e:
             print(f"[LOGIN ERROR] {e}")
@@ -116,7 +123,7 @@ class HexiumSniperBot(commands.Cog):
         if success:
             await ctx.send("✅ Logged in to Hexium")
         else:
-            await ctx.send("❌ Login failed")
+            await ctx.send("❌ Login failed — check console for details")
 
     @commands.command(name="logout")
     async def cmd_logout(self, ctx):
