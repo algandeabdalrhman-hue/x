@@ -18,6 +18,16 @@ HEXIUM_BASE = "https://hexium.zip"
 ANTICAPTCHA_BASE = "https://api.anti-captcha.com"
 HCAPTCHA_SITEKEY = "fe18e7a8-ca2a-41a6-b104-e934e006d6aa"
 
+# Free proxy list — rotates through them
+FREE_PROXIES = [
+    "http://proxy.example.com:8080",
+    "http://123.206.93.95:8118",
+    "http://47.91.44.217:8000",
+    "http://61.135.155.82:8118",
+]
+
+PROXY_IDX = 0
+
 class HexiumSniperBot(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -63,6 +73,8 @@ class HexiumSniperBot(commands.Cog):
         raise Exception("hCaptcha solve timeout")
 
     def login_hexium(self) -> bool:
+        global PROXY_IDX
+        
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -74,28 +86,51 @@ class HexiumSniperBot(commands.Cog):
                 "Origin": HEXIUM_BASE
             }
             
-            print(f"[LOGIN] Step 1: GET /login...")
-            resp_get = self.requests_session.get(f"{HEXIUM_BASE}/login", headers=headers, timeout=10)
-            print(f"[LOGIN] GET status: {resp_get.status_code}")
+            for attempt in range(len(FREE_PROXIES)):
+                proxy = FREE_PROXIES[PROXY_IDX % len(FREE_PROXIES)]
+                PROXY_IDX += 1
+                
+                print(f"[LOGIN] Attempt {attempt + 1}: Using proxy {proxy}")
+                
+                try:
+                    print(f"[LOGIN] GET /login via proxy...")
+                    resp_get = self.requests_session.get(f"{HEXIUM_BASE}/login", headers=headers, proxies={"http": proxy, "https": proxy}, timeout=5)
+                    print(f"[LOGIN] GET status: {resp_get.status_code}")
+                    
+                    if resp_get.status_code == 403:
+                        print(f"[LOGIN] Proxy blocked, trying next...")
+                        continue
+                    
+                    print(f"[LOGIN] POST credentials...")
+                    login_data = {
+                        "username": self.HEXIUM_USERNAME,
+                        "password": self.HEXIUM_PASSWORD
+                    }
+                    
+                    resp_post = self.requests_session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, proxies={"http": proxy, "https": proxy}, allow_redirects=True, timeout=5)
+                    print(f"[LOGIN] POST status: {resp_post.status_code}, URL: {resp_post.url}")
+                    
+                    if resp_post.status_code == 200 and "/home" in str(resp_post.url):
+                        self.cookies = self.requests_session.cookies
+                        self.logged_in = True
+                        print(f"[LOGIN] ✅ Login successful on proxy {proxy}")
+                        return True
+                    elif resp_post.status_code == 403:
+                        print(f"[LOGIN] Proxy blocked, trying next...")
+                        continue
+                    else:
+                        print(f"[LOGIN] Proxy {proxy} failed: {resp_post.status_code}")
+                        continue
+                        
+                except requests.exceptions.ProxyError:
+                    print(f"[LOGIN] Proxy {proxy} dead, trying next...")
+                    continue
+                except requests.exceptions.Timeout:
+                    print(f"[LOGIN] Proxy {proxy} timeout, trying next...")
+                    continue
             
-            print(f"[LOGIN] Step 2: POST credentials...")
-            login_data = {
-                "username": self.HEXIUM_USERNAME,
-                "password": self.HEXIUM_PASSWORD
-            }
-            
-            resp_post = self.requests_session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, allow_redirects=True, timeout=10)
-            print(f"[LOGIN] POST status: {resp_post.status_code}, URL: {resp_post.url}")
-            print(f"[LOGIN] Response start: {resp_post.text[:300]}")
-            
-            if resp_post.status_code == 200 and "/home" in str(resp_post.url):
-                self.cookies = self.requests_session.cookies
-                self.logged_in = True
-                print(f"[LOGIN] ✅ Login successful")
-                return True
-            else:
-                print(f"[LOGIN] ❌ Login failed with status {resp_post.status_code}")
-                return False
+            print(f"[LOGIN] ❌ All proxies exhausted")
+            return False
         except Exception as e:
             print(f"[LOGIN ERROR] {e}")
             return False
@@ -136,7 +171,7 @@ class HexiumSniperBot(commands.Cog):
         if success:
             await ctx.send("✅ Logged in to Hexium")
         else:
-            await ctx.send("❌ Login failed — check console for details")
+            await ctx.send("❌ Login failed on all proxies")
 
     @commands.command(name="logout")
     async def cmd_logout(self, ctx):
