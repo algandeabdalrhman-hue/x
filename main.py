@@ -63,10 +63,6 @@ class HexiumSniperBot(commands.Cog):
     async def login_hexium(self) -> bool:
         session = await self.ensure_session()
         try:
-            login_data = {
-                "username": self.HEXIUM_USERNAME,
-                "password": self.HEXIUM_PASSWORD
-            }
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -76,19 +72,34 @@ class HexiumSniperBot(commands.Cog):
                 "Referer": f"{HEXIUM_BASE}/",
                 "Origin": HEXIUM_BASE
             }
+            
+            # Step 1: GET /login to establish session and grab cookies
+            print(f"[LOGIN] Step 1: Establishing session...")
+            async with session.get(f"{HEXIUM_BASE}/login", headers=headers) as resp:
+                print(f"[LOGIN] Session GET status: {resp.status}")
+                session_cookies = resp.cookies
+            
+            # Step 2: POST credentials with established session
+            print(f"[LOGIN] Step 2: Posting credentials...")
+            login_data = {
+                "username": self.HEXIUM_USERNAME,
+                "password": self.HEXIUM_PASSWORD
+            }
+            
             async with session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, allow_redirects=True) as resp:
-                print(f"[LOGIN] Status: {resp.status}, URL after redirect: {resp.url}")
+                print(f"[LOGIN] POST status: {resp.status}, URL: {resp.url}")
                 
                 response_text = await resp.text()
                 print(f"[LOGIN] Response start: {response_text[:300]}")
                 
-                if resp.status == 200:
-                    self.cookies = resp.cookies
+                # Check if we got redirected to /home (success) or stayed on /login (fail)
+                if "/home" in str(resp.url) or resp.status == 200:
+                    self.cookies = session.cookie_jar
                     self.logged_in = True
                     print(f"[LOGIN] ✅ Login successful")
                     return True
                 else:
-                    print(f"[LOGIN] ❌ Login failed with status {resp.status}")
+                    print(f"[LOGIN] ❌ Login failed")
                     return False
         except Exception as e:
             print(f"[LOGIN ERROR] {e}")
