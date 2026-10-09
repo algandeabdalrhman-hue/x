@@ -5,6 +5,7 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import re
+import requests
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ class HexiumSniperBot(commands.Cog):
         self.max_stock = 100
         self.stock_limited = True
         self.start_time = None
+        self.requests_session = requests.Session()
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
@@ -60,8 +62,7 @@ class HexiumSniperBot(commands.Cog):
                     return result["solution"]["gRecaptchaResponse"]
         raise Exception("hCaptcha solve timeout")
 
-    async def login_hexium(self) -> bool:
-        session = await self.ensure_session()
+    def login_hexium(self) -> bool:
         try:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -73,34 +74,28 @@ class HexiumSniperBot(commands.Cog):
                 "Origin": HEXIUM_BASE
             }
             
-            # Step 1: GET /login to establish session and grab cookies
-            print(f"[LOGIN] Step 1: Establishing session...")
-            async with session.get(f"{HEXIUM_BASE}/login", headers=headers) as resp:
-                print(f"[LOGIN] Session GET status: {resp.status}")
-                session_cookies = resp.cookies
+            print(f"[LOGIN] Step 1: GET /login...")
+            resp_get = self.requests_session.get(f"{HEXIUM_BASE}/login", headers=headers, timeout=10)
+            print(f"[LOGIN] GET status: {resp_get.status_code}")
             
-            # Step 2: POST credentials with established session
-            print(f"[LOGIN] Step 2: Posting credentials...")
+            print(f"[LOGIN] Step 2: POST credentials...")
             login_data = {
                 "username": self.HEXIUM_USERNAME,
                 "password": self.HEXIUM_PASSWORD
             }
             
-            async with session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, allow_redirects=True) as resp:
-                print(f"[LOGIN] POST status: {resp.status}, URL: {resp.url}")
-                
-                response_text = await resp.text()
-                print(f"[LOGIN] Response start: {response_text[:300]}")
-                
-                # Check if we got redirected to /home (success) or stayed on /login (fail)
-                if "/home" in str(resp.url) or resp.status == 200:
-                    self.cookies = session.cookie_jar
-                    self.logged_in = True
-                    print(f"[LOGIN] ✅ Login successful")
-                    return True
-                else:
-                    print(f"[LOGIN] ❌ Login failed")
-                    return False
+            resp_post = self.requests_session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, allow_redirects=True, timeout=10)
+            print(f"[LOGIN] POST status: {resp_post.status_code}, URL: {resp_post.url}")
+            print(f"[LOGIN] Response start: {resp_post.text[:300]}")
+            
+            if resp_post.status_code == 200 and "/home" in str(resp_post.url):
+                self.cookies = self.requests_session.cookies
+                self.logged_in = True
+                print(f"[LOGIN] ✅ Login successful")
+                return True
+            else:
+                print(f"[LOGIN] ❌ Login failed with status {resp_post.status_code}")
+                return False
         except Exception as e:
             print(f"[LOGIN ERROR] {e}")
             return False
@@ -137,7 +132,7 @@ class HexiumSniperBot(commands.Cog):
         self.HEXIUM_USERNAME = username
         self.HEXIUM_PASSWORD = password
         async with ctx.typing():
-            success = await self.login_hexium()
+            success = self.login_hexium()
         if success:
             await ctx.send("✅ Logged in to Hexium")
         else:
