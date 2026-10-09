@@ -11,7 +11,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ITEM_DROP_CHANNEL_ID = 1524527819982377103
 SERVER_ID = 1524521375073697912
-ANTICAPTCHA_KEY = os.getenv("ANTICAPTCHA_KEY", "a00e43859df4c51e8a65fef2f90a49e9")
+ANTICAPTCHA_KEY = os.getenv("ANTICAPTCHA_KEY", "0be56327014fafb791b875c731722db7")
 
 HEXIUM_BASE = "https://hexium.zip"
 ANTICAPTCHA_BASE = "https://api.anti-captcha.com"
@@ -63,15 +63,22 @@ class HexiumSniperBot(commands.Cog):
     async def login_hexium(self) -> bool:
         session = await self.ensure_session()
         try:
-            # First attempt: login WITHOUT hCaptcha (it's signup-only on Hexium)
             login_data = {
                 "username": self.HEXIUM_USERNAME,
                 "password": self.HEXIUM_PASSWORD
             }
-            async with session.post(f"{HEXIUM_BASE}/login", data=login_data, allow_redirects=True) as resp:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate",
+                "Connection": "keep-alive",
+                "Referer": f"{HEXIUM_BASE}/",
+                "Origin": HEXIUM_BASE
+            }
+            async with session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, allow_redirects=True) as resp:
                 print(f"[LOGIN] Status: {resp.status}, URL after redirect: {resp.url}")
                 
-                # Log first 300 chars of response for debugging
                 response_text = await resp.text()
                 print(f"[LOGIN] Response start: {response_text[:300]}")
                 
