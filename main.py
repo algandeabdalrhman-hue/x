@@ -11,22 +11,10 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ITEM_DROP_CHANNEL_ID = 1524527819982377103
-SERVER_ID = 1524521375073697912
-ANTICAPTCHA_KEY = os.getenv("ANTICAPTCHA_KEY", "0be56327014fafb791b875c731722db7")
-
+ANTICAPTCHA_KEY = os.getenv("ANTICAPTCHA_KEY")
 HEXIUM_BASE = "https://hexium.zip"
 ANTICAPTCHA_BASE = "https://api.anti-captcha.com"
 HCAPTCHA_SITEKEY = "fe18e7a8-ca2a-41a6-b104-e934e006d6aa"
-
-# Free proxy list — rotates through them
-FREE_PROXIES = [
-    "http://proxy.example.com:8080",
-    "http://123.206.93.95:8118",
-    "http://47.91.44.217:8000",
-    "http://61.135.155.82:8118",
-]
-
-PROXY_IDX = 0
 
 class HexiumSniperBot(commands.Cog):
     def __init__(self, bot):
@@ -35,102 +23,79 @@ class HexiumSniperBot(commands.Cog):
         self.cookies = None
         self.is_running = False
         self.logged_in = False
-        self.HEXIUM_USERNAME = None
-        self.HEXIUM_PASSWORD = None
+        self.HEXIUM_USERNAME = os.getenv("HEXIUM_USERNAME")
+        self.HEXIUM_PASSWORD = os.getenv("HEXIUM_PASSWORD")
         self.buy_delay = 0
         self.max_stock = 100
         self.stock_limited = True
         self.start_time = None
-        self.requests_session = requests.Session()
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
 
-    async def solve_hcaptcha(self) -> str:
-        session = await self.ensure_session()
-        task_payload = {
-            "clientKey": ANTICAPTCHA_KEY,
-            "task": {
-                "type": "HCaptchaTaskProxyless",
-                "websiteURL": f"{HEXIUM_BASE}/login",
-                "websiteKey": HCAPTCHA_SITEKEY
-            }
-        }
-        async with session.post(f"{ANTICAPTCHA_BASE}/createTask", json=task_payload) as resp:
-            task_result = await resp.json()
-            if not task_result.get("taskId"):
-                raise Exception(f"hCaptcha task creation failed: {task_result}")
-            task_id = task_result["taskId"]
-        for attempt in range(60):
-            await asyncio.sleep(1)
-            result_payload = {"clientKey": ANTICAPTCHA_KEY, "taskId": task_id}
-            async with session.post(f"{ANTICAPTCHA_BASE}/getTaskResult", json=result_payload) as resp:
-                result = await resp.json()
-                if result.get("status") == "ready":
-                    return result["solution"]["gRecaptchaResponse"]
-        raise Exception("hCaptcha solve timeout")
-
     def login_hexium(self) -> bool:
-        global PROXY_IDX
-        
         try:
+            req_session = requests.Session()
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "Connection": "keep-alive",
+                "Origin": HEXIUM_BASE,
                 "Referer": f"{HEXIUM_BASE}/",
-                "Origin": HEXIUM_BASE
             }
             
-            for attempt in range(len(FREE_PROXIES)):
-                proxy = FREE_PROXIES[PROXY_IDX % len(FREE_PROXIES)]
-                PROXY_IDX += 1
-                
-                print(f"[LOGIN] Attempt {attempt + 1}: Using proxy {proxy}")
-                
-                try:
-                    print(f"[LOGIN] GET /login via proxy...")
-                    resp_get = self.requests_session.get(f"{HEXIUM_BASE}/login", headers=headers, proxies={"http": proxy, "https": proxy}, timeout=5)
-                    print(f"[LOGIN] GET status: {resp_get.status_code}")
-                    
-                    if resp_get.status_code == 403:
-                        print(f"[LOGIN] Proxy blocked, trying next...")
-                        continue
-                    
-                    print(f"[LOGIN] POST credentials...")
-                    login_data = {
-                        "username": self.HEXIUM_USERNAME,
-                        "password": self.HEXIUM_PASSWORD
-                    }
-                    
-                    resp_post = self.requests_session.post(f"{HEXIUM_BASE}/login", data=login_data, headers=headers, proxies={"http": proxy, "https": proxy}, allow_redirects=True, timeout=5)
-                    print(f"[LOGIN] POST status: {resp_post.status_code}, URL: {resp_post.url}")
-                    
-                    if resp_post.status_code == 200 and "/home" in str(resp_post.url):
-                        self.cookies = self.requests_session.cookies
-                        self.logged_in = True
-                        print(f"[LOGIN] ✅ Login successful on proxy {proxy}")
-                        return True
-                    elif resp_post.status_code == 403:
-                        print(f"[LOGIN] Proxy blocked, trying next...")
-                        continue
-                    else:
-                        print(f"[LOGIN] Proxy {proxy} failed: {resp_post.status_code}")
-                        continue
-                        
-                except requests.exceptions.ProxyError:
-                    print(f"[LOGIN] Proxy {proxy} dead, trying next...")
-                    continue
-                except requests.exceptions.Timeout:
-                    print(f"[LOGIN] Proxy {proxy} timeout, trying next...")
-                    continue
+            # GET /login first — grab cookies and any CSRF tokens
+            print("[LOGIN] GET /login...")
+            resp_get = req_session.get(
+                f"{HEXIUM_BASE}/login",
+                headers=headers,
+                timeout=10
+            )
+            print(f"[LOGIN] GET returned {resp_get.status_code}")
             
-            print(f"[LOGIN] ❌ All proxies exhausted")
-            return False
+            if resp_get.status_code != 200:
+                print(f"[LOGIN] GET /login failed with {resp_get.status_code}")
+                return False
+            
+            # Extract CSRF token if it exists
+            csrf_token = None
+            match = re.search(r'name=["\'](?:csrf|_token)["\'][^>]*value=["\']([^"\']+)["\']', resp_get.text, re.IGNORECASE)
+            if match:
+                csrf_token = match.group(1)
+                print(f"[LOGIN] Found CSRF token: {csrf_token[:20]}...")
+            else:
+                print("[LOGIN] No CSRF token found in form")
+            
+            # POST with credentials
+            login_data = {
+                "username": self.HEXIUM_USERNAME,
+                "password": self.HEXIUM_PASSWORD
+            }
+            if csrf_token:
+                login_data["csrf"] = csrf_token
+                login_data["_token"] = csrf_token
+            
+            print("[LOGIN] POST credentials...")
+            resp_post = req_session.post(
+                f"{HEXIUM_BASE}/login",
+                data=login_data,
+                headers=headers,
+                allow_redirects=True,
+                timeout=10
+            )
+            
+            print(f"[LOGIN] POST returned {resp_post.status_code}, URL: {resp_post.url}")
+            
+            if resp_post.status_code == 200 and "/home" in str(resp_post.url):
+                self.cookies = req_session.cookies
+                self.logged_in = True
+                print("[LOGIN] ✅ Logged in successfully")
+                return True
+            else:
+                print(f"[LOGIN] Failed — status {resp_post.status_code}, not redirected to /home")
+                return False
         except Exception as e:
             print(f"[LOGIN ERROR] {e}")
             return False
@@ -139,54 +104,37 @@ class HexiumSniperBot(commands.Cog):
         session = await self.ensure_session()
         try:
             await asyncio.sleep(self.buy_delay)
-            while True:
-                prepare_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/prepare/{asset_id}"
-                async with session.get(prepare_url, cookies=self.cookies) as resp:
-                    if resp.status != 200:
-                        await asyncio.sleep(0.5)
-                        continue
-                commit_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/commit"
-                commit_payload = {"assetId": asset_id}
-                async with session.post(commit_url, json=commit_payload, cookies=self.cookies) as resp:
-                    commit_result = await resp.json()
-                    if resp.status == 200:
-                        if commit_result.get("data"):
-                            for item in commit_result["data"]:
-                                if item.get("state") == "Completed":
-                                    return True, "bought"
-                        return False, "no_stock"
-                    else:
-                        await asyncio.sleep(0.5)
-                        continue
+            
+            prepare_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/prepare/{asset_id}"
+            async with session.get(prepare_url, cookies=self.cookies) as resp:
+                if resp.status != 200:
+                    print(f"[BUY] prepare/{asset_id} returned {resp.status}")
+                    return False, "prep_failed"
+            
+            commit_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/commit"
+            commit_payload = {"assetId": asset_id}
+            async with session.post(commit_url, json=commit_payload, cookies=self.cookies) as resp:
+                commit_result = await resp.json()
+                if resp.status == 200 and commit_result.get("data"):
+                    for item in commit_result["data"]:
+                        if item.get("state") == "Completed":
+                            return True, "bought"
+                return False, "no_stock"
         except Exception as e:
             print(f"[BUY ERROR] {e}")
             return False, "error"
 
-    @commands.command(name="login")
-    async def cmd_login(self, ctx, username: str, password: str):
-        self.HEXIUM_USERNAME = username
-        self.HEXIUM_PASSWORD = password
-        async with ctx.typing():
-            success = self.login_hexium()
-        if success:
-            await ctx.send("✅ Logged in to Hexium")
-        else:
-            await ctx.send("❌ Login failed on all proxies")
-
-    @commands.command(name="logout")
-    async def cmd_logout(self, ctx):
-        self.logged_in = False
-        self.cookies = None
-        await ctx.send("✅ Logged out")
-
     @commands.command(name="start")
     async def cmd_start(self, ctx):
         if not self.logged_in:
-            await ctx.send("❌ Not logged in. Run !login first.")
-            return
+            async with ctx.typing():
+                success = self.login_hexium()
+            if not success:
+                await ctx.send("❌ Login failed. Check console for details.")
+                return
         self.is_running = True
         self.start_time = asyncio.get_event_loop().time()
-        await ctx.send(f"✅ Started watching #item-releases (max stock: {self.max_stock}, delay: {self.buy_delay}s)")
+        await ctx.send(f"✅ Watching #item-releases (max stock: {self.max_stock}, delay: {self.buy_delay}s)")
 
     @commands.command(name="stop")
     async def cmd_stop(self, ctx):
@@ -226,22 +174,22 @@ class HexiumSniperBot(commands.Cog):
 async def setup(bot):
     cog = HexiumSniperBot(bot)
     await bot.add_cog(cog)
+    
     @bot.event
     async def on_message(message):
         if message.channel.id == ITEM_DROP_CHANNEL_ID and cog.is_running and cog.logged_in:
             if any(word in message.content.lower() for word in ["resell", "reseller", "marketplace"]):
                 return
+            
             matches = re.findall(r'https://hexium\.zip/catalog/(\d+)/', message.content)
             stocks = re.findall(r'(\d+)\(', message.content)
+            
             for i, asset_id_str in enumerate(matches):
                 asset_id = int(asset_id_str)
                 stock = int(stocks[i]) if i < len(stocks) else 1
-                should_buy = False
-                if cog.stock_limited:
-                    if stock <= cog.max_stock:
-                        should_buy = True
-                else:
-                    should_buy = True
+                
+                should_buy = not cog.stock_limited or stock <= cog.max_stock
+                
                 if should_buy:
                     bought, reason = await cog.buy_item(asset_id)
                     if bought:
@@ -250,6 +198,7 @@ async def setup(bot):
                         await message.reply(f"❌ FAILED itemId={asset_id} - no stock")
                     else:
                         await message.reply(f"❌ FAILED itemId={asset_id}")
+        
         await bot.process_commands(message)
 
 if __name__ == "__main__":
