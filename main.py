@@ -25,8 +25,8 @@ class HexiumSniperBot(commands.Cog):
         self.cookies = None
         self.is_running = False
         self.logged_in = False
-        self.HEXIUM_USERNAME = os.getenv("wsp")
-        self.HEXIUM_PASSWORD = os.getenv("good1732")
+        self.HEXIUM_USERNAME = os.getenv("HEXIUM_USERNAME")
+        self.HEXIUM_PASSWORD = os.getenv("HEXIUM_PASSWORD")
         self.buy_delay = 0.1
         self.max_stock = 100
         self.stock_limited = True
