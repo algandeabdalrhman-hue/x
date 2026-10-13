@@ -1,472 +1,424 @@
-import asyncio
-import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+import aiohttp
+import asyncio
+import logging
+from datetime import datetime
+import json
 import os
 from dotenv import load_dotenv
 import re
-import requests
-import json
-from datetime import datetime
+from anticaptchaofficial.recaptchav2proxyless import *
 
 load_dotenv()
 
+# config
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-ITEM_DROP_CHANNEL_ID = 1524527819982377103
-ANTICAPTCHA_KEY = os.getenv("ANTICAPTCHA_KEY", "0be56327014fafb791b875c731722db7")
-HEXIUM_BASE = "https://hexium.zip"
-ANTICAPTCHA_BASE = "https://api.anti-captcha.com"
+ANTI_CAPTCHA_KEY = os.getenv("ANTI_CAPTCHA_KEY")
+HEXIUM_USERNAME = os.getenv("HEXIUM_USERNAME")
+HEXIUM_PASSWORD = os.getenv("HEXIUM_PASSWORD")
 HCAPTCHA_SITEKEY = "fe18e7a8-ca2a-41a6-b104-e934e006d6aa"
+HEXIUM_BASE = "https://hexium.zip"
+CHANNEL_ID = 1524527819982377103
+GUILD_ID = 1524521375073697912
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger("HexiumSniper")
 
 class HexiumSniperBot(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.session = None
-        self.cookies = None
-        self.is_running = False
-        self.logged_in = False
-        self.HEXIUM_USERNAME = os.getenv("HEXIUM_USERNAME")
-        self.HEXIUM_PASSWORD = os.getenv("HEXIUM_PASSWORD")
-        self.buy_delay = 0.1
-        self.max_stock = 100
-        self.stock_limited = True
-        self.max_price = None
-        self.min_volume = 0
-        self.max_seller_limiteds = None
-        self.start_time = None
-        self.csrf_token = None
-        self.buys_this_session = 0
-        self.manual_snipe_id = None
-        self.seller_cache = {}
+	def __init__(self, bot):
+		self.bot = bot
+		self.session = None
+		self.auth_token = None
+		self.headers = {
+			"User-Agent": "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+		}
+		self.watching = False
+		self.manual_snipe_active = False
+		self.manual_snipe_itemid = None
+		self.manual_snipe_url = None
+		self.buy_delay = 0.1
+		self.filters = {
+			"max_stock": None,
+			"max_price": None,
+			"min_volume": 0,
+			"max_reseller_limiteds": None
+		}
+		self.seller_cache = {}
+		self.buy_count = 0
+		self.start_time = None
+	
+	async def setup_session(self):
+		if not self.session:
+			self.session = aiohttp.ClientSession()
+	
+	async def login(self):
+		"""login via hCaptcha + anti-captcha.com"""
+		try:
+			await self.setup_session()
+			
+			# solve hCaptcha
+			solver = recaptchaV2Proxyless()
+			solver.set_verbose(1)
+			solver.set_captcha_type(4)  # hCaptcha
+			solver.set_website_url(f"{HEXIUM_BASE}/login")
+			solver.set_website_key(HCAPTCHA_SITEKEY)
+			solver.set_api_key(ANTI_CAPTCHA_KEY)
+			
+			g_response = solver.solve_and_return_solution()
+			if not g_response:
+				logger.error("hCaptcha solve failed")
+				return False
+			
+			# POST login
+			async with self.session.post(
+				f"{HEXIUM_BASE}/login",
+				json={
+					"username": HEXIUM_USERNAME,
+					"password": HEXIUM_PASSWORD,
+					"h-captcha-response": g_response
+				},
+				headers=self.headers
+			) as resp:
+				if resp.status == 200:
+					data = await resp.json()
+					self.auth_token = data.get("token") or resp.cookies.get("auth")
+					self.headers["Authorization"] = f"Bearer {self.auth_token}"
+					logger.info("Login successful")
+					return True
+				else:
+					logger.error(f"Login failed: {resp.status}")
+					return False
+		
+		except Exception as e:
+			logger.error(f"Login error: {e}")
+			return False
+	
+	async def get_item_details(self, item_id):
+		"""fetch item price, stock, seller"""
+		try:
+			async with self.session.post(
+				f"{HEXIUM_BASE}/apisite/catalog/v1/catalog/items/details",
+				json={"items": [{"itemType": "Asset", "id": str(item_id)}]},
+				headers=self.headers
+			) as resp:
+				if resp.status == 200:
+					data = await resp.json()
+					if data.get("data") and len(data["data"]) > 0:
+						item = data["data"][0]
+						return {
+							"name": item.get("name"),
+							"price": item.get("price"),
+							"stock": item.get("stock"),
+							"seller_id": item.get("creatorId"),
+							"item_id": item_id
+						}
+		except Exception as e:
+			logger.error(f"get_item_details error: {e}")
+		return None
+	
+	async def get_resale_data(self, item_id):
+		"""fetch volume from resale market"""
+		try:
+			async with self.session.get(
+				f"{HEXIUM_BASE}/apisite/economy/v1/assets/{item_id}/resale-data",
+				headers=self.headers
+			) as resp:
+				if resp.status == 200:
+					data = await resp.json()
+					return {
+						"volume": data.get("volumeTradedInLastThirtyDays", 0),
+						"average_price": data.get("averagePrice", 0)
+					}
+		except Exception as e:
+			logger.error(f"get_resale_data error: {e}")
+		return {"volume": 0, "average_price": 0}
+	
+	async def check_seller_portfolio(self, seller_id):
+		"""cache seller's limited item count"""
+		if seller_id in self.seller_cache:
+			cached = self.seller_cache[seller_id]
+			if tick() - cached["timestamp"] < 300:  # 5min cache
+				return cached
+		
+		try:
+			async with self.session.get(
+				f"{HEXIUM_BASE}/users/profile/robloxcollections-json?userId={seller_id}",
+				headers=self.headers
+			) as resp:
+				if resp.status == 200:
+					data = await resp.json()
+					limited_count = len([x for x in data.get("items", []) if x.get("isLimited")])
+					total_count = len(data.get("items", []))
+					
+					self.seller_cache[seller_id] = {
+						"limited_count": limited_count,
+						"total_count": total_count,
+						"timestamp": tick()
+					}
+					return self.seller_cache[seller_id]
+		except Exception as e:
+			logger.error(f"check_seller_portfolio error: {e}")
+		
+		return {"limited_count": 0, "total_count": 0, "timestamp": tick()}
+	
+	async def should_buy(self, item_details, resale_data):
+		"""check all filters"""
+		# stock filter
+		if self.filters["max_stock"] and item_details["stock"] > self.filters["max_stock"]:
+			return False, "stock too high"
+		
+		# price filter
+		if self.filters["max_price"] and item_details["price"] > self.filters["max_price"]:
+			return False, "price too high"
+		
+		# volume filter
+		if resale_data["volume"] < self.filters["min_volume"]:
+			return False, "volume too low"
+		
+		# reseller portfolio filter
+		if self.filters["max_reseller_limiteds"]:
+			seller_portfolio = await self.check_seller_portfolio(item_details["seller_id"])
+			if seller_portfolio["limited_count"] > self.filters["max_reseller_limiteds"]:
+				return False, "seller has too many limiteds"
+		
+		return True, "pass"
+	
+	async def buy_item(self, item_id):
+		"""prepare + commit buy"""
+		try:
+			# step 1: prepare
+			async with self.session.get(
+				f"{HEXIUM_BASE}/apisite/economy/v1/purchases/prepare/{item_id}",
+				headers=self.headers
+			) as resp:
+				if resp.status != 200:
+					logger.error(f"Prepare failed: {resp.status}")
+					return False
+			
+			await asyncio.sleep(0.05)
+			
+			# step 2: commit
+			async with self.session.post(
+				f"{HEXIUM_BASE}/apisite/economy/v1/purchases/commit",
+				json={"assetId": item_id},
+				headers=self.headers
+			) as resp:
+				if resp.status == 200:
+					data = await resp.json()
+					if data.get("data") and len(data["data"]) > 0 and data["data"][0].get("state") == "Completed":
+						self.buy_count += 1
+						logger.info(f"BUY SUCCESS: {item_id}")
+						return True
+		
+		except Exception as e:
+			logger.error(f"buy_item error: {e}")
+		
+		return False
+	
+	async def manual_snipe_loop(self):
+		"""50ms polling loop for manual item snipe"""
+		while self.manual_snipe_active:
+			try:
+				if self.manual_snipe_itemid:
+					item_details = await self.get_item_details(self.manual_snipe_itemid)
+					resale_data = await self.get_resale_data(self.manual_snipe_itemid)
+					
+					if item_details:
+						should_buy, reason = await self.should_buy(item_details, resale_data)
+						if should_buy:
+							bought = await self.buy_item(self.manual_snipe_itemid)
+							if bought:
+								logger.info(f"Manual snipe SUCCESS: {self.manual_snipe_itemid}")
+				
+				await asyncio.sleep(self.buy_delay)
+			
+			except Exception as e:
+				logger.error(f"manual_snipe_loop error: {e}")
+				await asyncio.sleep(0.5)
+	
+	@commands.command(name="start")
+	async def cmd_start(self, ctx):
+		"""start bot: login + watch channel"""
+		if await self.login():
+			self.watching = True
+			self.start_time = datetime.now()
+			await ctx.send("✅ Logged in, watching #item-releases")
+		else:
+			await ctx.send("❌ Login failed")
+	
+	@commands.command(name="startlink")
+	async def cmd_startlink(self, ctx, url: str):
+		"""snipe specific item from URL"""
+		# extract item ID from URL (hexium.zip/catalog/ITEMID/name)
+		match = re.search(r'/catalog/(\d+)/', url)
+		if match:
+			item_id = int(match.group(1))
+			self.manual_snipe_itemid = item_id
+			self.manual_snipe_active = True
+			self.manual_snipe_url = url
+			self.start_time = datetime.now()
+			
+			if not self.watching:
+				login_ok = await self.login()
+				if not login_ok:
+					await ctx.send("❌ Login failed")
+					return
+			
+			self.bot.loop.create_task(self.manual_snipe_loop())
+			await ctx.send(f"🎯 Sniping {item_id} from {url}")
+		else:
+			await ctx.send("❌ Invalid URL format")
+	
+	@commands.command(name="stoplink")
+	async def cmd_stoplink(self, ctx):
+		"""stop manual item snipe"""
+		self.manual_snipe_active = False
+		self.manual_snipe_itemid = None
+		await ctx.send("⏹️ Stopped item snipe, channel still watching")
+	
+	@commands.command(name="stop")
+	async def cmd_stop(self, ctx):
+		"""stop channel watch"""
+		self.watching = False
+		await ctx.send("⏹️ Stopped watching")
+	
+	@commands.command(name="killall")
+	async def cmd_killall(self, ctx):
+		"""stop everything"""
+		self.watching = False
+		self.manual_snipe_active = False
+		await ctx.send("⏹️ All stopped")
+	
+	@commands.command(name="status")
+	async def cmd_status(self, ctx):
+		"""current bot status"""
+		uptime = "N/A"
+		if self.start_time:
+			uptime = str(datetime.now() - self.start_time)
+		
+		status_text = (
+			f"🔍 Watching: {self.watching}\n"
+			f"🎯 Manual snipe: {self.manual_snipe_active}\n"
+			f"⏱️ Uptime: {uptime}\n"
+			f"💰 Buys: {self.buy_count}\n"
+			f"📊 Filters: {json.dumps(self.filters, indent=2)}"
+		)
+		await ctx.send(f"```\n{status_text}\n```")
+	
+	@commands.command(name="sec")
+	async def cmd_buy_delay(self, ctx, delay: float):
+		"""set buy delay (0.05-10s, default 0.1s)"""
+		if 0.05 <= delay <= 10:
+			self.buy_delay = delay
+			await ctx.send(f"✅ Buy delay set to {delay}s")
+		else:
+			await ctx.send("❌ Delay must be 0.05-10 seconds")
+	
+	@commands.command(name="stock")
+	async def cmd_stock_filter(self, ctx, max_stock: int):
+		"""only buy items ≤ N stock"""
+		self.filters["max_stock"] = max_stock
+		await ctx.send(f"✅ Stock filter: ≤{max_stock}")
+	
+	@commands.command(name="maxstock")
+	async def cmd_maxstock(self, ctx):
+		"""buy all stock levels"""
+		self.filters["max_stock"] = None
+		await ctx.send("✅ Stock filter disabled")
+	
+	@commands.command(name="price")
+	async def cmd_price_filter(self, ctx, max_robux: int):
+		"""only buy below N robux"""
+		self.filters["max_price"] = max_robux
+		await ctx.send(f"✅ Price filter: ≤{max_robux}R$")
+	
+	@commands.command(name="noprice")
+	async def cmd_noprice(self, ctx):
+		"""disable price filter"""
+		self.filters["max_price"] = None
+		await ctx.send("✅ Price filter disabled")
+	
+	@commands.command(name="volume")
+	async def cmd_volume_filter(self, ctx, min_volume: int):
+		"""minimum recent sales volume"""
+		self.filters["min_volume"] = min_volume
+		await ctx.send(f"✅ Volume filter: ≥{min_volume} sales")
+	
+	@commands.command(name="reseller")
+	async def cmd_reseller_filter(self, ctx, max_limiteds: int):
+		"""skip if seller owns >N limited items"""
+		self.filters["max_reseller_limiteds"] = max_limiteds
+		await ctx.send(f"✅ Reseller filter: ≤{max_limiteds} limiteds")
+	
+	@commands.command(name="no-reseller")
+	async def cmd_no_reseller(self, ctx):
+		"""disable reseller filter"""
+		self.filters["max_reseller_limiteds"] = None
+		await ctx.send("✅ Reseller filter disabled")
+	
+	@commands.command(name="seller")
+	async def cmd_check_seller(self, ctx, user_id: int):
+		"""check user portfolio"""
+		portfolio = await self.check_seller_portfolio(user_id)
+		await ctx.send(
+			f"User {user_id}:\n"
+			f"Limited items: {portfolio['limited_count']}\n"
+			f"Total items: {portfolio['total_count']}"
+		)
+	
+	@commands.command(name="debug")
+	async def cmd_debug(self, ctx, item_id: int):
+		"""full item data + decision"""
+		item = await self.get_item_details(item_id)
+		resale = await self.get_resale_data(item_id)
+		should, reason = await self.should_buy(item, resale)
+		
+		debug_text = (
+			f"Item: {item['name']}\n"
+			f"Price: {item['price']}R$\n"
+			f"Stock: {item['stock']}\n"
+			f"Seller: {item['seller_id']}\n"
+			f"Volume: {resale['volume']}\n"
+			f"Decision: {should} ({reason})"
+		)
+		await ctx.send(f"```\n{debug_text}\n```")
+	
+	@commands.Cog.listener()
+	async def on_message(self, message):
+		"""listen for drops in #item-releases"""
+		if not self.watching or message.channel.id != CHANNEL_ID or message.author.bot:
+			return
+		
+		# parse drop message: @item drop ping https://hexium.zip/catalog/ITEMID/...
+		if "hexium.zip/catalog" in message.content:
+			match = re.search(r'/catalog/(\d+)/', message.content)
+			if match:
+				item_id = int(match.group(1))
+				item_details = await self.get_item_details(item_id)
+				resale_data = await self.get_resale_data(item_id)
+				
+				if item_details:
+					should_buy, reason = await self.should_buy(item_details, resale_data)
+					if should_buy:
+						bought = await self.buy_item(item_id)
+						if bought:
+							logger.info(f"AUTO SNIPE SUCCESS: {item_id} ({item_details['name']})")
 
-    async def ensure_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-        return self.session
+def tick():
+	return datetime.now().timestamp()
 
-    async def solve_hcaptcha(self) -> str:
-        session = await self.ensure_session()
-        task_payload = {
-            "clientKey": ANTICAPTCHA_KEY,
-            "task": {
-                "type": "HCaptchaTaskProxyless",
-                "websiteURL": f"{HEXIUM_BASE}/login",
-                "websiteKey": HCAPTCHA_SITEKEY
-            }
-        }
-        print("[CAPTCHA] Requesting hCaptcha solve...")
-        async with session.post(f"{ANTICAPTCHA_BASE}/createTask", json=task_payload) as resp:
-            task_result = await resp.json()
-            if not task_result.get("taskId"):
-                raise Exception(f"hCaptcha task creation failed: {task_result}")
-            task_id = task_result["taskId"]
-            print(f"[CAPTCHA] Task created: {task_id}")
-        for attempt in range(60):
-            await asyncio.sleep(1)
-            result_payload = {"clientKey": ANTICAPTCHA_KEY, "taskId": task_id}
-            async with session.post(f"{ANTICAPTCHA_BASE}/getTaskResult", json=result_payload) as resp:
-                result = await resp.json()
-                if result.get("status") == "ready":
-                    token = result["solution"]["gRecaptchaResponse"]
-                    print(f"[CAPTCHA] Solved in {attempt+1}s")
-                    return token
-        raise Exception("hCaptcha solve timeout")
-
-    def login_hexium(self) -> bool:
-        try:
-            req_session = requests.Session()
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Origin": HEXIUM_BASE,
-                "Referer": f"{HEXIUM_BASE}/login",
-            }
-            print("[LOGIN] Getting login page...")
-            resp_get = req_session.get(f"{HEXIUM_BASE}/login", headers=headers, timeout=10)
-            if resp_get.status_code != 200:
-                print(f"[LOGIN] GET /login failed: {resp_get.status_code}")
-                return False
-            print("[LOGIN] ✓ Page loaded")
-            print("[LOGIN] Solving hCaptcha...")
-            import asyncio as aio_login
-            captcha_token = aio_login.run_until_complete(self.solve_hcaptcha())
-            login_data = {
-                "username": self.HEXIUM_USERNAME,
-                "password": self.HEXIUM_PASSWORD,
-                "h-captcha-response": captcha_token
-            }
-            print("[LOGIN] POSTing credentials + captcha...")
-            resp_post = req_session.post(
-                f"{HEXIUM_BASE}/login",
-                data=login_data,
-                headers=headers,
-                allow_redirects=True,
-                timeout=10
-            )
-            print(f"[LOGIN] POST returned {resp_post.status_code}, URL: {resp_post.url}")
-            if resp_post.status_code == 200 and "/home" in str(resp_post.url):
-                self.cookies = req_session.cookies
-                self.logged_in = True
-                self.csrf_token = self._extract_csrf(resp_post.text)
-                print("[LOGIN] ✅ Logged in successfully")
-                return True
-            else:
-                print(f"[LOGIN] ❌ Failed — status {resp_post.status_code}")
-                return False
-        except Exception as e:
-            print(f"[LOGIN ERROR] {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _extract_csrf(self, html: str) -> str:
-        try:
-            match = re.search(r'csrf["\']?\s*:\s*["\']([^"\']+)["\']', html)
-            if match:
-                return match.group(1)
-        except:
-            pass
-        return ""
-
-    async def get_item_details(self, item_id: int) -> dict:
-        """Fetch item metadata: name, price, creator, restrictions"""
-        session = await self.ensure_session()
-        try:
-            url = f"{HEXIUM_BASE}/apisite/catalog/v1/catalog/items/details"
-            headers = {
-                "Content-Type": "application/json",
-                "x-csrf-token": self.csrf_token or ""
-            }
-            payload = {"items": [{"itemType": "Asset", "id": item_id}]}
-            async with session.post(url, json=payload, headers=headers, cookies=self.cookies, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("data") and len(data["data"]) > 0:
-                        return data["data"][0]
-                return None
-        except Exception as e:
-            print(f"[DETAILS ERROR] {e}")
-            return None
-
-    async def get_resale_data(self, item_id: int) -> dict:
-        """Fetch resale market data: stock, avg price, volume trends"""
-        session = await self.ensure_session()
-        try:
-            url = f"{HEXIUM_BASE}/apisite/economy/v1/assets/{item_id}/resale-data"
-            headers = {"x-csrf-token": self.csrf_token or ""}
-            async with session.get(url, headers=headers, cookies=self.cookies, timeout=5) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return None
-        except Exception as e:
-            print(f"[RESALE ERROR] {e}")
-            return None
-
-    async def get_user_collection(self, user_id: int) -> dict:
-        """Fetch user's owned items (limited + unlimited)"""
-        session = await self.ensure_session()
-        try:
-            url = f"{HEXIUM_BASE}/users/profile/robloxcollections-json?userId={user_id}"
-            headers = {"x-csrf-token": self.csrf_token or ""}
-            async with session.get(url, headers=headers, cookies=self.cookies, timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    items = data.get("CollectionsItems", [])
-                    item_ids = [item["Id"] for item in items]
-                    limiteds = [item["Id"] for item in items if item["AssetRestrictionIcon"].get("CssTag") == "limited"]
-                    self.seller_cache[user_id] = {
-                        "item_ids": item_ids,
-                        "limited_count": len(limiteds),
-                        "total_count": len(items),
-                        "last_updated": datetime.now().isoformat()
-                    }
-                    return self.seller_cache[user_id]
-                return None
-        except Exception as e:
-            print(f"[COLLECTION ERROR] {e}")
-            return None
-
-    async def should_buy(self, details: dict, resale: dict, seller_collection: dict = None) -> tuple:
-        """Decision logic with all filters"""
-        if not details or not resale:
-            return False, "no_data"
-        
-        stock = resale.get("numberRemaining", 0)
-        avg_price = resale.get("recentAveragePrice", 0)
-        price_points = resale.get("priceDataPoints", [])
-        recent_price = price_points[-1]["value"] if price_points else avg_price
-        
-        if self.stock_limited and stock > self.max_stock:
-            return False, f"stock_too_high ({stock})"
-        
-        if self.max_price and recent_price > self.max_price:
-            return False, f"above_max_price ({recent_price})"
-        
-        volume_points = resale.get("volumeDataPoints", [])
-        recent_vol = volume_points[-1]["value"] if volume_points else 0
-        if recent_vol < self.min_volume:
-            return False, f"low_volume ({recent_vol})"
-        
-        if self.max_seller_limiteds and seller_collection:
-            if seller_collection.get("limited_count", 0) > self.max_seller_limiteds:
-                return False, f"reseller_portfolio ({seller_collection['limited_count']} limiteds)"
-        
-        return True, "pass"
-
-    async def buy_item(self, asset_id: int) -> tuple:
-        """Prepare + Commit purchase flow"""
-        session = await self.ensure_session()
-        try:
-            await asyncio.sleep(self.buy_delay)
-            prepare_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/prepare/{asset_id}"
-            async with session.get(prepare_url, cookies=self.cookies, timeout=5) as resp:
-                if resp.status != 200:
-                    return False, "prep_failed"
-            commit_url = f"{HEXIUM_BASE}/apisite/economy/v1/purchases/commit"
-            commit_payload = {"assetId": asset_id}
-            async with session.post(commit_url, json=commit_payload, cookies=self.cookies, timeout=5) as resp:
-                commit_result = await resp.json()
-                if resp.status == 200 and commit_result.get("data"):
-                    for item in commit_result["data"]:
-                        if item.get("state") == "Completed":
-                            self.buys_this_session += 1
-                            return True, "bought"
-                return False, "no_stock"
-        except Exception as e:
-            print(f"[BUY ERROR] {e}")
-            return False, "error"
-
-    async def manual_snipe_loop(self):
-        """Continuously try to buy manual snipe item"""
-        while True:
-            if self.manual_snipe_id and self.logged_in:
-                details = await self.get_item_details(self.manual_snipe_id)
-                resale = await self.get_resale_data(self.manual_snipe_id)
-                
-                seller_collection = None
-                if self.max_seller_limiteds:
-                    lowest_seller = details.get("lowestSellerData", {}) if details else {}
-                    seller_id = lowest_seller.get("userId")
-                    if seller_id:
-                        seller_collection = await self.get_user_collection(seller_id)
-                
-                should_buy, reason = await self.should_buy(details, resale, seller_collection)
-                if should_buy:
-                    bought, buy_reason = await self.buy_item(self.manual_snipe_id)
-                    if bought:
-                        channel = self.bot.get_channel(ITEM_DROP_CHANNEL_ID)
-                        if channel:
-                            await channel.send(f"✅ MANUAL SNIPE BOUGHT {self.manual_snipe_id}")
-                        self.manual_snipe_id = None
-            await asyncio.sleep(0.05)
-
-    @commands.command(name="start")
-    async def cmd_start(self, ctx):
-        if not self.logged_in:
-            async with ctx.typing():
-                success = self.login_hexium()
-            if not success:
-                await ctx.send("❌ Login failed.")
-                return
-        self.is_running = True
-        self.start_time = asyncio.get_event_loop().time()
-        self.buys_this_session = 0
-        filters = f"max_stock={self.max_stock}" if self.stock_limited else "all_stock"
-        if self.max_price:
-            filters += f", max_price={self.max_price}"
-        if self.min_volume:
-            filters += f", min_vol={self.min_volume}"
-        if self.max_seller_limiteds:
-            filters += f", no_resellers(>{self.max_seller_limiteds})"
-        await ctx.send(f"✅ Watching #item-releases ({filters}, delay={self.buy_delay}s)")
-
-    @commands.command(name="startlink")
-    async def cmd_startlink(self, ctx, item_link: str):
-        """Manually snipe a specific item + keep watching #item-releases"""
-        try:
-            match = re.search(r'https://hexium\.zip/catalog/(\d+)/', item_link)
-            if not match:
-                await ctx.send("❌ Invalid link format")
-                return
-            asset_id = int(match.group(1))
-            self.manual_snipe_id = asset_id
-            if not self.logged_in:
-                async with ctx.typing():
-                    success = self.login_hexium()
-                if not success:
-                    await ctx.send("❌ Login failed.")
-                    return
-            self.is_running = True
-            self.start_time = asyncio.get_event_loop().time()
-            self.buys_this_session = 0
-            await ctx.send(f"✅ Sniping item {asset_id} + watching #item-releases")
-        except Exception as e:
-            await ctx.send(f"❌ Error: {e}")
-
-    @commands.command(name="stoplink")
-    async def cmd_stoplink(self, ctx):
-        """Stop manual link snipe — channel still watching"""
-        self.manual_snipe_id = None
-        await ctx.send("✅ Link snipe disabled (#item-releases still watching)")
-
-    @commands.command(name="stop")
-    async def cmd_stop(self, ctx):
-        """Stop channel watch — manual snipe still active"""
-        self.is_running = False
-        await ctx.send(f"✅ Channel watch stopped ({self.buys_this_session} buys)")
-
-    @commands.command(name="killall")
-    async def cmd_killall(self, ctx):
-        """Stop both channel watch and manual snipe"""
-        self.is_running = False
-        self.manual_snipe_id = None
-        await ctx.send(f"✅ All sniping stopped ({self.buys_this_session} buys)")
-
-    @commands.command(name="status")
-    async def cmd_status(self, ctx):
-        uptime = ""
-        if self.is_running and self.start_time:
-            elapsed = asyncio.get_event_loop().time() - self.start_time
-            minutes, seconds = int(elapsed // 60), int(elapsed % 60)
-            uptime = f"Uptime: {minutes}m {seconds}s\n"
-        filters = f"Max stock: {self.max_stock}\n" if self.stock_limited else "Max stock: unlimited\n"
-        if self.max_price:
-            filters += f"Max price: {self.max_price}\n"
-        if self.min_volume:
-            filters += f"Min volume: {self.min_volume}\n"
-        if self.max_seller_limiteds:
-            filters += f"No resellers (>{self.max_seller_limiteds})\n"
-        manual = f"Manual snipe: {self.manual_snipe_id}\n" if self.manual_snipe_id else ""
-        status = f"Logged in: {self.logged_in}\nChannel watching: {self.is_running}\n{uptime}{manual}{filters}Delay: {self.buy_delay}s\nTotal buys: {self.buys_this_session}"
-        await ctx.send(f"```{status}```")
-
-    @commands.command(name="sec")
-    async def cmd_sec(self, ctx, delay: float):
-        if delay < 0.05 or delay > 10:
-            await ctx.send("❌ Delay must be 0.05–10s")
-            return
-        self.buy_delay = delay
-        await ctx.send(f"✅ Delay: {delay}s")
-
-    @commands.command(name="stock")
-    async def cmd_stock(self, ctx, max_stock: int):
-        self.max_stock = max_stock
-        self.stock_limited = True
-        await ctx.send(f"✅ Max stock: {max_stock}")
-
-    @commands.command(name="maxstock")
-    async def cmd_maxstock(self, ctx):
-        self.stock_limited = False
-        await ctx.send("✅ Buying all stock")
-
-    @commands.command(name="price")
-    async def cmd_price(self, ctx, max_price: int):
-        self.max_price = max_price
-        await ctx.send(f"✅ Max price: {max_price} robux")
-
-    @commands.command(name="noprice")
-    async def cmd_noprice(self, ctx):
-        self.max_price = None
-        await ctx.send("✅ Price filter disabled")
-
-    @commands.command(name="volume")
-    async def cmd_volume(self, ctx, min_vol: int):
-        self.min_volume = min_vol
-        await ctx.send(f"✅ Min volume: {min_vol}")
-
-    @commands.command(name="reseller")
-    async def cmd_reseller(self, ctx, max_limiteds: int):
-        """Skip items if lowest seller owns more than N limited items"""
-        self.max_seller_limiteds = max_limiteds
-        await ctx.send(f"✅ Skipping if reseller owns >{max_limiteds} limited items")
-
-    @commands.command(name="no-reseller")
-    async def cmd_no_reseller(self, ctx):
-        """Disable reseller filter"""
-        self.max_seller_limiteds = None
-        await ctx.send("✅ Reseller filter disabled")
-
-    @commands.command(name="seller")
-    async def cmd_seller(self, ctx, user_id: int):
-        """Check seller's collection"""
-        async with ctx.typing():
-            collection = await self.get_user_collection(user_id)
-        if collection:
-            msg = f"**User {user_id}** Portfolio:\n"
-            msg += f"Total items: {collection['total_count']}\n"
-            msg += f"Limited items: {collection['limited_count']}\n"
-            msg += f"Last updated: {collection['last_updated']}"
-            await ctx.send(msg)
-        else:
-            await ctx.send(f"❌ Failed to fetch collection for user {user_id}")
-
-    @commands.command(name="debug")
-    async def cmd_debug(self, ctx, item_id: int):
-        """Fetch full item + resale data"""
-        async with ctx.typing():
-            details = await self.get_item_details(item_id)
-            resale = await self.get_resale_data(item_id)
-        if details and resale:
-            should_buy, reason = await self.should_buy(details, resale)
-            lowest_seller = details.get("lowestSellerData", {})
-            seller_id = lowest_seller.get("userId")
-            msg = f"**{details.get('name')}** (ID {item_id})\n"
-            msg += f"Price: {resale.get('recentAveragePrice')} robux\n"
-            msg += f"Stock remaining: {resale.get('numberRemaining')}\n"
-            msg += f"Recent volume: {resale['volumeDataPoints'][-1]['value'] if resale.get('volumeDataPoints') else 0}\n"
-            if seller_id:
-                msg += f"Lowest seller: {lowest_seller.get('username')} (ID {seller_id})\n"
-            msg += f"Decision: {'✅ BUY' if should_buy else f'❌ {reason}'}"
-            await ctx.send(msg)
-        else:
-            await ctx.send(f"❌ Failed to fetch data for {item_id}")
-
-async def setup(bot):
-    cog = HexiumSniperBot(bot)
-    await bot.add_cog(cog)
-    bot.loop.create_task(cog.manual_snipe_loop())
-
-    @bot.event
-    async def on_message(message):
-        if message.channel.id == ITEM_DROP_CHANNEL_ID and cog.is_running and cog.logged_in:
-            if any(word in message.content.lower() for word in ["resell", "reseller", "marketplace"]):
-                return
-            matches = re.findall(r'https://hexium\.zip/catalog/(\d+)/', message.content)
-            for asset_id_str in matches:
-                asset_id = int(asset_id_str)
-                details = await cog.get_item_details(asset_id)
-                resale = await cog.get_resale_data(asset_id)
-                
-                seller_collection = None
-                if cog.max_seller_limiteds:
-                    lowest_seller = details.get("lowestSellerData", {}) if details else {}
-                    seller_id = lowest_seller.get("userId")
-                    if seller_id:
-                        seller_collection = await cog.get_user_collection(seller_id)
-                
-                should_buy, reason = await cog.should_buy(details, resale, seller_collection)
-                if should_buy:
-                    bought, buy_reason = await cog.buy_item(asset_id)
-                    if bought:
-                        await message.reply(f"✅ BOUGHT {asset_id}")
-                    else:
-                        await message.reply(f"❌ BUY FAILED ({buy_reason})")
-                else:
-                    await message.reply(f"⏭️ SKIPPED ({reason})")
-        await bot.process_commands(message)
+async def main():
+	intents = discord.Intents.default()
+	intents.message_content = True
+	bot = commands.Bot(command_prefix="!", intents=intents)
+	
+	@bot.event
+	async def on_ready():
+		logger.info(f"Bot logged in as {bot.user}")
+	
+	await bot.add_cog(HexiumSniperBot(bot))
+	await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    intents = discord.Intents.default()
-    intents.message_content = True
-    bot = commands.Bot(command_prefix="!", intents=intents)
-
-    @bot.event
-    async def on_ready():
-        print(f"Bot online as {bot.user}")
-
-    async def main():
-        async with bot:
-            await setup(bot)
-            await bot.start(DISCORD_TOKEN)
-
-    asyncio.run(main())
+	asyncio.run(main())
